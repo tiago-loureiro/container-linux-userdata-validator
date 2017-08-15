@@ -17,12 +17,14 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"runtime/debug"
+	"os"
 
 	"github.com/coreos/coreos-cloudinit/config/validate"
 	ignConfig "github.com/coreos/ignition/config"
@@ -33,8 +35,9 @@ import (
 
 var (
 	flags = struct {
-		port    int
-		address string
+		port       int
+		address    string
+		parseStdin bool
 	}{}
 )
 
@@ -56,6 +59,7 @@ func (h panicHandler) Handle(e interface{}) {
 func init() {
 	flag.StringVar(&flags.address, "address", "0.0.0.0", "address to listen on")
 	flag.IntVar(&flags.port, "port", 80, "port to bind on")
+	flag.BoolVar(&flags.parseStdin, "parseStdin", false, "If set to true, parses stdin and exits")
 
 	nap.PayloadWrapper = payloadWrapper{}
 	nap.PanicHandler = panicHandler{}
@@ -70,21 +74,59 @@ func init() {
 func main() {
 	flag.Parse()
 
-	router := mux.NewRouter()
-	server := &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", flags.address, flags.port),
-		Handler: router,
+	if flags.parseStdin {
+		sz, cfg, err := fileValidate()
+		if err != nil {
+			log.Printf("Fatal error parsing: %s\n", err);
+		} else if sz == 0 {
+			log.Printf("Config file looks good");
+		} else {
+			log.Printf("Failed to validate config: %s\n", cfg);
+		}
+	} else {
+		router := mux.NewRouter()
+		server := &http.Server{
+			Addr:    fmt.Sprintf("%s:%d", flags.address, flags.port),
+			Handler: router,
+		}
+
+		router.Handle("/validate", nap.HandlerFunc(optionsValidate)).Methods("OPTIONS")
+		router.Handle("/validate", nap.HandlerFunc(putValidate)).Methods("PUT")
+		router.Handle("/health", nap.HandlerFunc(getHealth)).Methods("GET")
+
+		log.Fatalln(server.ListenAndServe())
 	}
-
-	router.Handle("/validate", nap.HandlerFunc(optionsValidate)).Methods("OPTIONS")
-	router.Handle("/validate", nap.HandlerFunc(putValidate)).Methods("PUT")
-	router.Handle("/health", nap.HandlerFunc(getHealth)).Methods("GET")
-
-	log.Fatalln(server.ListenAndServe())
 }
 
 func optionsValidate(r *http.Request) (interface{}, nap.Status) {
 	return nil, nap.OK{}
+}
+
+func fileValidate() (int, interface{}, error) {
+	src, err := ioutil.ReadAll(os.Stdin)
+	if err != nil {
+		return -1, nil, errors.New(err.Error())
+	}
+
+	config := bytes.Replace(src, []byte("\r"), []byte{}, -1)
+
+	_, rpt, err := ignConfig.Parse(config)
+	switch err {
+	case ignConfig.ErrCloudConfig, ignConfig.ErrEmpty, ignConfig.ErrScript:
+		rpt, err := validate.Validate(config)
+		if err != nil {
+			return -1, nil, errors.New(err.Error())
+		}
+		return len(rpt.Entries()), rpt.Entries(), nil
+	case ignConfig.ErrUnknownVersion:
+		return 1, []report.Entry{{
+			Kind:    report.EntryError,
+			Message: "Unknown ignition version",
+		}}, nil
+	default:
+		rpt.Sort()
+		return len(rpt.Entries), rpt.Entries, nil
+	}
 }
 
 func putValidate(r *http.Request) (interface{}, nap.Status) {
